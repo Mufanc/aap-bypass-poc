@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eux
+adb push "$1" /data/local/tmp/aap-bypass-poc
+adb shell chmod +x /data/local/tmp/aap-bypass-poc
+shift
+adb shell su -c /data/local/tmp/aap-bypass-poc "$@"
