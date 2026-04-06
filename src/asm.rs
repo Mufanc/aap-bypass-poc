@@ -12,8 +12,8 @@ macro_rules! arm64asm {
 
              dynasm!($ops
                  ; .arch aarch64
-                 ; .alias xir, x17
-                 ; .alias wir, w17
+                 ; .alias xtm, x17
+                 ; .alias wtm, w17
                  $($t)*
              )
          }
@@ -84,8 +84,8 @@ pub fn shellcode(shellcode_addr: u64, return_addr: u64, backup: &[u8]) -> anyhow
         // if *((int *) (client + 0x124)) == 0 && state == 0 {
         //     state = 1;
         // }
-        ; ldr wir, [x1, #0x124]
-        ; cbnz wir, >skip
+        ; ldr wtm, [x1, #0x124]
+        ; cbnz wtm, >skip
         ; cmp x2, #0
         ; cinc x2, x2, eq
         ; skip:
