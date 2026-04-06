@@ -1,6 +1,6 @@
 mod asm;
 mod properties;
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, bail, ensure};
 use log::{debug, info};
 use nix::libc::pid_t;
 use nix::sys::signal::{Signal, kill};
@@ -8,18 +8,21 @@ use nix::unistd::Pid;
 use nix::unistd::{SysconfVar, sysconf};
 use object::elf::PF_X;
 use object::{Object, ObjectSegment, SegmentFlags};
-use procfs::process::{MMapPath, Process};
+use procfs::process::{MMPermissions, MMapPath, Process};
 use r3solvr::{BasicResolver, Query, SymbolResolver};
+use std::collections::HashSet;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 static PAGE_SIZE: LazyLock<u64> =
     LazyLock::new(|| sysconf(SysconfVar::PAGE_SIZE).unwrap().unwrap() as u64);
 
-const TARGET_SYMBOL: &str = "_ZN7android18AudioPolicyService13setAppState_lENS_2spINS_5media11audiopolicy17AudioRecordClientEEE11app_state_t";
+const TARGET_SYMBOL_34: &str =
+    "_ZN7android18AudioPolicyService13setAppState_lENS_2spINS0_17AudioRecordClientEEE11app_state_t";
+
+const TARGET_SYMBOL_35: &str = "_ZN7android18AudioPolicyService13setAppState_lENS_2spINS_5media11audiopolicy17AudioRecordClientEEE11app_state_t";
 
 fn read_mem(pid: pid_t, addr: u64, buffer: &mut [u8]) -> anyhow::Result<()> {
     let mut file = File::open(format!("/proc/{pid}/mem"))?;
@@ -41,30 +44,69 @@ fn write_mem(pid: pid_t, addr: u64, data: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn find_audio_server() -> anyhow::Result<pid_t> {
-    properties::get("init.svc_debug_pid.audioserver")
-        .ok_or_else(|| anyhow::anyhow!("failed to read property"))
-        .and_then(|value| {
-            value
-                .parse::<i32>()
-                .map_err(|err| anyhow!("failed to parse pid: {err}"))
-        })
-}
+fn find_target_symbol(proc: &Process, target_symbol: &str) -> anyhow::Result<(u64, Vec<u8>, u64)> {
+    let maps = proc.maps()?;
+    let mut tried = HashSet::new();
 
-fn find_library(proc: &Process, name: &str) -> anyhow::Result<(PathBuf, u64)> {
-    for map in proc.maps()? {
+    let rxp = MMPermissions::READ | MMPermissions::EXECUTE | MMPermissions::PRIVATE;
+
+    for map in &maps {
+        if map.perms != rxp {
+            continue;
+        }
+
         let MMapPath::Path(pathname) = &map.pathname else {
             continue;
         };
 
-        if pathname.file_name().is_some_and(|n| n == name) {
-            info!("library: {}", pathname.display());
-            info!("base addr: {:#x}", map.address.0);
-            return Ok((pathname.clone(), map.address.0));
+        if !pathname
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains("audio"))
+        {
+            continue;
         }
+
+        if !tried.insert(pathname.clone()) {
+            continue;
+        }
+
+        let data = match fs::read(pathname) {
+            Ok(data) => data,
+            Err(err) => {
+                debug!("failed to read {}: {err}", pathname.display());
+                continue;
+            }
+        };
+
+        let resolver = match BasicResolver::from_data(data.clone()) {
+            Ok(resolver) => resolver,
+            Err(err) => {
+                debug!("failed to parse {}: {err}", pathname.display());
+                continue;
+            }
+        };
+
+        let sym = match resolver.lookup_symbol(Query::new(target_symbol).with_debugdata(true)) {
+            Ok(sym) => sym,
+            Err(_) => continue,
+        };
+
+        let func_offset = sym.addr as u64;
+
+        // find base address from the first mapping of this file
+        let base_addr = maps
+            .iter()
+            .find(|m| matches!(&m.pathname, MMapPath::Path(p) if p == pathname))
+            .map(|m| m.address.0)
+            .unwrap();
+
+        info!("found target symbol in {}", pathname.display());
+        info!("base addr: {:#x}", base_addr);
+
+        return Ok((base_addr, data, func_offset));
     }
 
-    Err(anyhow!("{name} not found"))
+    bail!("`{target_symbol}` not found")
 }
 
 fn find_executable_holes(elf_data: &[u8], base_addr: u64) -> anyhow::Result<Vec<(u64, u64)>> {
@@ -125,7 +167,7 @@ fn analyze_hook_point(pid: pid_t, func_addr: u64) -> anyhow::Result<(u64, u64, [
 
     let first_insn = u32::from_le_bytes(buffer);
     let hook_addr = if asm::is_pacia_insn(first_insn) {
-        debug!("found PACIA instruction at function entry, skipping...");
+        info!("found PACIA instruction at function entry, skipping...");
         func_addr + 4
     } else {
         func_addr
@@ -197,25 +239,32 @@ fn inject_hook(
 }
 
 fn main() -> anyhow::Result<()> {
+    unsafe {
+        std::env::set_var("RUST_LOG", "debug");
+    }
+
     env_logger::init();
 
-    let pid = find_audio_server()?;
+    let pid = properties::find_audio_server()?;
     let proc = Process::new(pid)?;
     info!("audio server pid: {}", pid);
 
-    let (lib_path, base_addr) = find_library(&proc, "libaudiopolicyservice.so")?;
+    let api = properties::api_version()?;
+    info!("API version: {api}");
 
-    let elf_data = fs::read(&lib_path)?;
-    let holes = find_executable_holes(&elf_data, base_addr)?;
-
-    // resolve target function symbol
-    let func_offset = {
-        let resolver = BasicResolver::from_data(elf_data)?;
-        resolver
-            .lookup_symbol(Query::new(TARGET_SYMBOL).with_debugdata(true))?
-            .addr as u64
+    let target_symbol = if api < 34 {
+        bail!("unsupported API version: {api}");
+    } else if api < 35 {
+        TARGET_SYMBOL_34
+    } else {
+        TARGET_SYMBOL_35
     };
+
+    let (base_addr, data, func_offset) = find_target_symbol(&proc, target_symbol)?;
+
+    let holes = find_executable_holes(&data, base_addr)?;
     let func_addr = base_addr + func_offset;
+
     info!(
         "AudioPolicyService::setAppState_l: {:#x} (offset {:#x})",
         func_addr, func_offset
@@ -225,10 +274,10 @@ fn main() -> anyhow::Result<()> {
 
     let shellcode_size = asm::shellcode(0, 0, &backup)?.len() as u64;
     let shellcode_addr = find_shellcode_slot(&holes, shellcode_size)?;
+
     info!("shellcode addr: {:#x}", shellcode_addr);
 
     let shellcode = asm::shellcode(shellcode_addr, return_addr, &backup)?;
-
     let branch = asm::encode_branch(hook_addr, shellcode_addr)?;
 
     inject_hook(pid, shellcode_addr, &shellcode, hook_addr, &branch)?;
