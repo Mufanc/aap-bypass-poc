@@ -81,10 +81,13 @@ pub fn shellcode(shellcode_addr: u64, return_addr: u64, backup: &[u8]) -> anyhow
 
     arm64asm!(ops
         // https://cs.android.com/android/platform/superproject/+/android-latest-release:frameworks/av/services/audiopolicy/service/AudioPolicyService.cpp;l=1245-1274;drc=277d3cc7a0bcb34146e142736321c99faaac0500
-        // if *((int *) (client + 0x124)) == 0 && state == 0 {
+        // if *((int *) (client + 0x12c)) == 0 && state == 0 {
         //     state = 1;
         // }
-        ; ldr wtm, [x1, #0x124]
+        ; ldr xtm, [x1]  // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#non-trivial-parameters
+        ; ldr wtm, [xtm, #0x12c]  // load uid from: 0x12c offset + 0x8 vptr + 0x4 pid
+        // ; cmp wtm, #1000
+        // ; b.gt >skip
         ; cbnz wtm, >skip
         ; cmp x2, #0
         ; cinc x2, x2, eq
